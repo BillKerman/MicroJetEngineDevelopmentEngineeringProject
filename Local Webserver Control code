@@ -1,0 +1,685 @@
+/*
+ * Microjet Engine Control Server - MERGED with ESC Control
+ * Compressor motor now controlled via 30A ESC + BLDC motor
+ * 
+ * CRITICAL WIRING:
+ * - GPIO 18: ESC Signal Wire (white/yellow) for Compressor BLDC
+ * - GPIO 19: L298N ENA for Fuel Pump PWM
+ * - GPIO 22: L298N IN1 for Fuel Pump
+ * - GPIO 23: L298N IN2 for Fuel Pump  
+ * - GPIO 21: Spark Plug Control (Active-LOW Relay)
+ * - GPIO 2:  Built-in LED (test)
+ * - GND: Connect ESP32 GND to ESC GND (keep ESC 5V disconnected!)
+ */
+
+// Libraries
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WebSocketsServer.h>
+#include <ArduinoJson.h>
+#include <ESP32Servo.h>
+
+// ---------- WiFi credentials ----------
+const char* ssid = "IITRPR";
+const char* password = "V#6qF?pyM!bQ$%NX";
+// ---------- Hardware pin assignments ----------
+const int COMPRESSOR_ESC_PIN = 18;  // *** CHANGED: ESC signal pin for BLDC motor ***
+const int FUELPUMP_ENA       = 19;  // PWM Enable pin for L298N
+const int FUELPUMP_IN1       = 22;  // IN1 for L298N direction
+const int FUELPUMP_IN2       = 23;  // IN2 for L298N direction
+const int SPARK_PIN          = 21;  // Digital pin for spark plug control
+const int BUILTIN_LED        = 2;   // Built-in LED for testing
+
+// --- ESC Control Object ---
+Servo compressorESC;
+int currentCompressorPulse = 1000; // Current ESC pulse width (1000-2000 µs)
+
+// --- Fuel Pump PWM settings ---
+const int MIN_DUTY_CYCLE = 50;  // Minimum PWM to overcome motor friction
+
+// --- Spark Plug Pulse Timing ---
+unsigned long lastSparkTime = 0;
+const unsigned long SPARK_PULSE_INTERVAL = 1500; // 1.5 seconds
+bool sparkPulseState = false;
+
+// --- Global state variables ---
+int compressor_on = 0;
+int compressor_speed = 0;     // 0-100 scale
+int fuelpump_on = 0;
+int fuelpump_speed = 0;
+int spark_on = 0;
+int builtin_led_on = 0;
+
+// --- WebServer and WebSocket ---
+WebServer server(80);
+WebSocketsServer webSocket = WebSocketsServer(81);
+
+// --- HTML Webpage ---
+const char webpage[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MicroJet Engine Control</title>
+  <style>
+    body {
+      background-color: #EEEEEE;
+      font-family: Arial, sans-serif;
+      color: #003366;
+      padding: 20px;
+      display: flex;
+      justify-content: center;
+    }
+    .container {
+      max-width: 600px;
+      width: 100%;
+    }
+    h1 {
+      margin-top: 0;
+      text-align: center;
+    }
+    .card {
+      background: #fff;
+      padding: 20px;
+      border-radius: 8px;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
+      margin-bottom: 16px;
+    }
+    .row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 16px;
+      margin-bottom: 16px;
+    }
+    .btn {
+      padding: 8px 12px;
+      border-radius: 6px;
+      border: 1px solid #ccc;
+      background: #f5f5f5;
+      cursor: pointer;
+      font-size: 1em;
+      min-width: 70px;
+      text-align: center;
+    }
+    .btn.active {
+      background: #0077cc;
+      color: #fff;
+      border-color: #005fa3;
+      font-weight: bold;
+    }
+    .label {
+      min-width: 140px;
+      font-weight: bold;
+      flex-basis: 140px;
+    }
+    .slider {
+      flex: 1;
+      min-width: 150px;
+    }
+    .value {
+      font-weight: 600;
+      min-width: 30px;
+      text-align: right;
+    }
+    .status {
+      font-size: 0.9em;
+      color: #666;
+      text-align: center;
+      margin-top: 10px;
+    }
+    .card-test {
+      background: #fdfdfd;
+      border: 1px dashed #aaa;
+      padding: 15px;
+      border-radius: 8px;
+    }
+    .warning {
+      background: #fff3cd;
+      color: #856404;
+      padding: 10px;
+      border-radius: 4px;
+      margin-bottom: 16px;
+      border-left: 4px solid #ffc107;
+    }
+    .info {
+      background: #d1ecf1;
+      color: #0c5460;
+      padding: 10px;
+      border-radius: 4px;
+      margin-bottom: 16px;
+      border-left: 4px solid #17a2b8;
+    }
+    
+    /* Throttle Bar Styles */
+    .throttle-bar-container {
+      width: 100%;
+      margin-top: 8px;
+      margin-bottom: 4px;
+    }
+    .throttle-bar-bg {
+      width: 100%;
+      height: 24px;
+      background: linear-gradient(to right, #e0e0e0 0%, #90ee90 50%, #ffa500 75%, #ff4444 100%);
+      border-radius: 12px;
+      position: relative;
+      overflow: hidden;
+      box-shadow: inset 0 2px 4px rgba(0,0,0,0.1);
+    }
+    .throttle-bar-fill {
+      height: 100%;
+      width: 0%;
+      background: rgba(0, 119, 204, 0.3);
+      transition: width 0.2s ease;
+      border-radius: 12px;
+    }
+    .throttle-bar-value {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      font-weight: bold;
+      font-size: 0.85em;
+      color: #003366;
+      text-shadow: 0 0 3px white;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="container">
+    <h1>🚀 MicroJet Engine Control v1.0</h1>
+
+    <div class="card">
+      <!-- Compressor (ESC-controlled BLDC) -->
+      <div class="row">
+        <div class="label">Compressor Motor (ESC)</div>
+        <button id="btn_compressor" class="btn">OFF</button>
+        <input id="slider_compressor" class="slider" type="range" min="0" max="100" value="0">
+        <div class="value" id="val_compressor">0</div>
+      </div>
+      <div class="throttle-bar-container">
+        <div class="throttle-bar-bg">
+          <div class="throttle-bar-fill" id="throttle_bar_compressor"></div>
+          <div class="throttle-bar-value" id="throttle_val_compressor">0%</div>
+        </div>
+      </div>
+
+      <!-- Fuel Pump -->
+      <div class="row">
+        <div class="label">Fuel Pump</div>
+        <button id="btn_fuelpump" class="btn">OFF</button>
+        <input id="slider_fuelpump" class="slider" type="range" min="0" max="100" value="0">
+        <div class="value" id="val_fuelpump">0</div>
+      </div>
+      <div class="throttle-bar-container">
+        <div class="throttle-bar-bg">
+          <div class="throttle-bar-fill" id="throttle_bar_fuelpump"></div>
+          <div class="throttle-bar-value" id="throttle_val_fuelpump">0%</div>
+        </div>
+      </div>
+
+      <!-- Spark Plug -->
+      <div class="row">
+        <div class="label">Spark Plug</div>
+        <button id="btn_spark" class="btn">OFF</button>
+      </div>
+    </div>
+
+    <!-- Test LED Card -->
+    <div class="card card-test">
+      <div class="row">
+        <div class="label">Test (Built-in LED)</div>
+        <button id="btn_led" class="btn">OFF</button>
+      </div>
+    </div>
+
+    <div class="status">
+      WebSocket Status: <span id="ws_status">Connecting...</span>
+    </div>
+  </div>
+
+  <script>
+    let Socket = null;
+    const wsStatus = document.getElementById('ws_status');
+
+    function init() {
+      Socket = new WebSocket('ws://' + window.location.hostname + ':81/');
+      
+      Socket.onopen = function() {
+        console.log('WebSocket open');
+        wsStatus.textContent = 'Connected';
+        wsStatus.style.color = 'green';
+      };
+      
+      Socket.onmessage = function(event) {
+        processCommand(event);
+      };
+      
+      Socket.onclose = function() {
+        console.log('WS closed');
+        wsStatus.textContent = 'Disconnected';
+        wsStatus.style.color = 'red';
+        setTimeout(init, 3000);
+      };
+      
+      Socket.onerror = function(e) {
+        console.warn('WS error', e);
+        wsStatus.textContent = 'Error';
+        wsStatus.style.color = 'orange';
+      };
+    }
+
+    const btnCompressor = document.getElementById('btn_compressor');
+    const btnFuel = document.getElementById('btn_fuelpump');
+    const btnSpark = document.getElementById('btn_spark');
+    const btnLed = document.getElementById('btn_led');
+
+    const sliderCompressor = document.getElementById('slider_compressor');
+    const sliderFuel = document.getElementById('slider_fuelpump');
+
+    const valCompressor = document.getElementById('val_compressor');
+    const valFuel = document.getElementById('val_fuelpump');
+    
+    const throttleBarCompressor = document.getElementById('throttle_bar_compressor');
+    const throttleValCompressor = document.getElementById('throttle_val_compressor');
+    const throttleBarFuel = document.getElementById('throttle_bar_fuelpump');
+    const throttleValFuel = document.getElementById('throttle_val_fuelpump');
+
+    let state = {
+      compressor_on: 0,
+      fuelpump_on: 0,
+      spark_on: 0,
+      compressor_speed: 0,
+      fuelpump_speed: 0,
+      builtin_led_on: 0
+    };
+
+    function updateThrottleBar(barElement, valueElement, percentage) {
+      barElement.style.width = percentage + '%';
+      valueElement.textContent = percentage + '%';
+    }
+
+    function toggleButton(buttonElem, on) {
+      if (on) {
+        buttonElem.classList.add('active');
+        buttonElem.textContent = 'ON';
+      } else {
+        buttonElem.classList.remove('active');
+        buttonElem.textContent = 'OFF';
+      }
+    }
+
+    function sendMessage(obj) {
+      if (!Socket || Socket.readyState !== WebSocket.OPEN) {
+        console.warn('Socket not open, cannot send', obj);
+        return;
+      }
+      Socket.send(JSON.stringify(obj));
+    }
+
+    btnCompressor.addEventListener('click', function() {
+      state.compressor_on = state.compressor_on ? 0 : 1;
+      toggleButton(btnCompressor, state.compressor_on);
+      sendMessage({ type: 'COMPRESSOR_toggle', value: state.compressor_on });
+
+      if (!state.compressor_on) {
+        sliderCompressor.value = 0;
+        valCompressor.textContent = 0;
+        updateThrottleBar(throttleBarCompressor, throttleValCompressor, 0);
+        sendMessage({ type: 'COMPRESSOR_speed', value: 0 });
+      }
+    });
+
+    btnFuel.addEventListener('click', function() {
+      state.fuelpump_on = state.fuelpump_on ? 0 : 1;
+      toggleButton(btnFuel, state.fuelpump_on);
+      sendMessage({ type: 'FUELPUMP_toggle', value: state.fuelpump_on });
+
+      if (!state.fuelpump_on) {
+        sliderFuel.value = 0;
+        valFuel.textContent = 0;
+        updateThrottleBar(throttleBarFuel, throttleValFuel, 0);
+        sendMessage({ type: 'FUELPUMP_speed', value: 0 });
+      }
+    });
+
+    btnSpark.addEventListener('click', function() {
+      state.spark_on = state.spark_on ? 0 : 1;
+      toggleButton(btnSpark, state.spark_on);
+      sendMessage({ type: 'SPARK_toggle', value: state.spark_on });
+    });
+
+    btnLed.addEventListener('click', function() {
+      state.builtin_led_on = state.builtin_led_on ? 0 : 1;
+      toggleButton(btnLed, state.builtin_led_on);
+      sendMessage({ type: 'BUILTIN_LED_toggle', value: state.builtin_led_on });
+    });
+
+    sliderCompressor.addEventListener('input', function() {
+      const v = parseInt(sliderCompressor.value);
+      valCompressor.textContent = v;
+      updateThrottleBar(throttleBarCompressor, throttleValCompressor, v);
+      state.compressor_speed = v;
+      sendMessage({ type: 'COMPRESSOR_speed', value: v });
+
+      if (v > 0 && !state.compressor_on) {
+        state.compressor_on = 1;
+        toggleButton(btnCompressor, 1);
+        sendMessage({ type: 'COMPRESSOR_toggle', value: 1 });
+      }
+    });
+
+    sliderFuel.addEventListener('input', function() {
+      const v = parseInt(sliderFuel.value);
+      valFuel.textContent = v;
+      updateThrottleBar(throttleBarFuel, throttleValFuel, v);
+      state.fuelpump_speed = v;
+      sendMessage({ type: 'FUELPUMP_speed', value: v });
+
+      if (v > 0 && !state.fuelpump_on) {
+        state.fuelpump_on = 1;
+        toggleButton(btnFuel, 1);
+        sendMessage({ type: 'FUELPUMP_toggle', value: 1 });
+      }
+    });
+
+    function processCommand(event) {
+      try {
+        const obj = JSON.parse(event.data);
+        const t = obj.type;
+        const v = parseInt(obj.value);
+
+        console.log("Received command:", obj);
+
+        switch (t) {
+          case 'COMPRESSOR_toggle':
+            state.compressor_on = v;
+            toggleButton(btnCompressor, v);
+            break;
+          case 'FUELPUMP_toggle':
+            state.fuelpump_on = v;
+            toggleButton(btnFuel, v);
+            break;
+          case 'SPARK_toggle':
+            state.spark_on = v;
+            toggleButton(btnSpark, v);
+            break;
+          case 'COMPRESSOR_speed':
+            state.compressor_speed = v;
+            sliderCompressor.value = v;
+            valCompressor.textContent = v;
+            updateThrottleBar(throttleBarCompressor, throttleValCompressor, v);
+            break;
+          case 'FUELPUMP_speed':
+            state.fuelpump_speed = v;
+            sliderFuel.value = v;
+            valFuel.textContent = v;
+            updateThrottleBar(throttleBarFuel, throttleValFuel, v);
+            break;
+          case 'BUILTIN_LED_toggle':
+            state.builtin_led_on = v;
+            toggleButton(btnLed, v);
+            break;
+          default:
+            console.log('Unknown message type', t);
+        }
+      } catch (e) {
+        console.error('Invalid JSON from server', e, event.data);
+      }
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
+)rawliteral";
+
+void sendJson(String l_type, String l_value) {
+  String jsonString = "";
+  StaticJsonDocument<200> doc;
+  JsonObject object = doc.to<JsonObject>();
+  object["type"] = l_type;
+  object["value"] = l_value;
+  serializeJson(doc, jsonString);
+  webSocket.broadcastTXT(jsonString);
+}
+
+// *** NEW FUNCTION: Smooth ESC speed transition ***
+void setCompressorSpeedSmooth(int targetPulse) {
+  int step = (currentCompressorPulse < targetPulse) ? 1 : -1;
+  
+  while (currentCompressorPulse != targetPulse) {
+    currentCompressorPulse += step;
+    compressorESC.writeMicroseconds(currentCompressorPulse);
+    delay(5); // 5ms per step for smooth acceleration
+  }
+  
+  Serial.printf("Compressor ESC pulse width: %d µs\n", currentCompressorPulse);
+}
+
+void updateOutputs() {
+  // 1. Compressor Motor (ESC-controlled BLDC)
+  if (compressor_on && compressor_speed > 0) {
+    int targetPulse = map(compressor_speed, 0, 100, 1000, 2000);
+    
+    Serial.printf("Compressor: Speed=%d%%, Target Pulse=%d µs\n", 
+                  compressor_speed, targetPulse);
+    
+    // Smooth transition to target speed
+    setCompressorSpeedSmooth(targetPulse);
+    
+  } else {
+    // Stop motor smoothly
+    if (currentCompressorPulse > 1000) {
+      Serial.println("Stopping compressor motor...");
+      setCompressorSpeedSmooth(1000);
+    }
+    currentCompressorPulse = 1000;
+    compressorESC.writeMicroseconds(1000);
+  }
+
+  // 2. Spark Plug - PULSING LOGIC (Active-LOW Relay with Open-Drain Logic)
+  if (spark_on) {
+    unsigned long currentTime = millis();
+    
+    // Check if 1.5 seconds have passed since last pulse
+    if (currentTime - lastSparkTime >= SPARK_PULSE_INTERVAL) {
+      sparkPulseState = !sparkPulseState; // Toggle pulse state
+      lastSparkTime = currentTime;
+      
+      if (sparkPulseState) {
+        // Turn ON: Pull pin to Ground (relay activates)
+        pinMode(SPARK_PIN, OUTPUT);
+        digitalWrite(SPARK_PIN, LOW);
+        Serial.println("Spark: PULSE ON (Grounding pin)");
+      } else {
+        // Turn OFF: Float the pin (relay deactivates via pull-up resistor)
+        pinMode(SPARK_PIN, INPUT);
+        Serial.println("Spark: PULSE OFF (Floating pin)");
+      }
+    }
+  } else {
+    // Spark is disabled - ensure it's OFF
+    pinMode(SPARK_PIN, INPUT);
+    sparkPulseState = false;
+    lastSparkTime = millis(); // Reset timer for next enable
+  }
+
+  // 3. Test LED (Digital)
+  digitalWrite(BUILTIN_LED, builtin_led_on ? HIGH : LOW);
+
+  // 4. Fuel Pump (PWM + L298N Direction)
+  if (fuelpump_on && fuelpump_speed > 0) {
+    digitalWrite(FUELPUMP_IN1, HIGH);
+    digitalWrite(FUELPUMP_IN2, LOW);
+    
+    int dutyCycle = map(fuelpump_speed, 0, 100, MIN_DUTY_CYCLE, 255);
+    analogWrite(FUELPUMP_ENA, dutyCycle);
+    
+    Serial.printf("Fuel Pump: Speed=%d%%, PWM Duty=%d\n", fuelpump_speed, dutyCycle);
+
+  } else {
+    analogWrite(FUELPUMP_ENA, 0);
+    digitalWrite(FUELPUMP_IN1, LOW);
+    digitalWrite(FUELPUMP_IN2, LOW);
+  }
+}
+
+void webSocketEvent(byte num, WStype_t type, uint8_t * payload, size_t length) {
+  switch (type) {
+    case WStype_DISCONNECTED:
+      Serial.println("Client " + String(num) + " disconnected");
+      break;
+    
+    case WStype_CONNECTED:
+      Serial.println("Client " + String(num) + " connected");
+      // Send current state to newly connected client
+      sendJson("COMPRESSOR_toggle", String(compressor_on));
+      sendJson("COMPRESSOR_speed", String(compressor_speed));
+      sendJson("FUELPUMP_toggle", String(fuelpump_on));
+      sendJson("FUELPUMP_speed", String(fuelpump_speed));
+      sendJson("SPARK_toggle", String(spark_on));
+      sendJson("BUILTIN_LED_toggle", String(builtin_led_on));
+      break;
+
+    case WStype_TEXT:
+      {
+        StaticJsonDocument<200> doc;
+        DeserializationError error = deserializeJson(doc, payload);
+        if (error) {
+          Serial.print(F("deserializeJson() failed: "));
+          Serial.println(error.f_str());
+          return;
+        }
+
+        const char* msg_type = doc["type"];
+        const int msg_value = doc["value"];
+
+        Serial.println("Received: " + String(msg_type) + " = " + String(msg_value));
+
+        // Handle Compressor Messages
+        if (String(msg_type) == "COMPRESSOR_toggle") {
+          compressor_on = msg_value;
+          sendJson("COMPRESSOR_toggle", String(compressor_on));
+        } 
+        else if (String(msg_type) == "COMPRESSOR_speed") {
+          compressor_speed = msg_value;
+          sendJson("COMPRESSOR_speed", String(compressor_speed));
+          compressor_on = (compressor_speed > 0) ? 1 : 0;
+          sendJson("COMPRESSOR_toggle", String(compressor_on));
+        }
+        
+        // Handle Fuel Pump Messages
+        else if (String(msg_type) == "FUELPUMP_toggle") {
+          fuelpump_on = msg_value;
+          sendJson("FUELPUMP_toggle", String(fuelpump_on));
+        }
+        else if (String(msg_type) == "FUELPUMP_speed") {
+          fuelpump_speed = msg_value;
+          sendJson("FUELPUMP_speed", String(fuelpump_speed));
+          fuelpump_on = (fuelpump_speed > 0) ? 1 : 0;
+          sendJson("FUELPUMP_toggle", String(fuelpump_on));
+        }
+
+        // Handle Spark Plug Message
+        else if (String(msg_type) == "SPARK_toggle") {
+          spark_on = msg_value;
+          sendJson("SPARK_toggle", String(spark_on));
+        }
+
+        // Handle Test LED Message
+        else if (String(msg_type) == "BUILTIN_LED_toggle") {
+          builtin_led_on = msg_value;
+          sendJson("BUILTIN_LED_toggle", String(builtin_led_on));
+        }
+
+        // Update all physical outputs
+        updateOutputs();
+        Serial.println("---");
+      }
+      break;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n=== MicroJet Engine Control v1.0 (ESC Integrated) ===");
+
+  // *** ESC SETUP - CRITICAL SECTION ***
+  Serial.println("Initializing ESC control...");
+  
+  // Allocate PWM timers for servo library
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+  
+  // Attach ESC (50Hz standard for ESCs)
+  compressorESC.setPeriodHertz(50);
+  compressorESC.attach(COMPRESSOR_ESC_PIN, 1000, 2000);
+  
+  // SAFE ARMING: Start with minimum signal
+  compressorESC.writeMicroseconds(1000);
+  currentCompressorPulse = 1000;
+  
+  Serial.println("✓ ESC attached to GPIO 18");
+  Serial.println("✓ ESC arming sequence: 1000µs signal sent");
+  delay(2000); // Wait for ESC to recognize signal
+  Serial.println("✓ ESC armed and ready!");
+
+  // Setup other pins
+  pinMode(SPARK_PIN, INPUT);  // *** FIXED: Start as INPUT (floating = OFF) ***
+  pinMode(BUILTIN_LED, OUTPUT);
+  pinMode(FUELPUMP_IN1, OUTPUT);
+  pinMode(FUELPUMP_IN2, OUTPUT);
+  pinMode(FUELPUMP_ENA, OUTPUT);
+  
+  // Set initial states
+  digitalWrite(BUILTIN_LED, LOW);
+  digitalWrite(FUELPUMP_IN1, LOW);
+  digitalWrite(FUELPUMP_IN2, LOW);
+  analogWrite(FUELPUMP_ENA, 0);
+  
+  Serial.println("✓ All pins initialized (Spark relay: FLOATING = OFF)");
+
+  // Connect to WiFi
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\n✓ Connected to WiFi!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  // Start WebServer
+  server.on("/", []() {
+    server.send_P(200, "text/html", webpage);
+  });
+  server.begin();
+  Serial.println("✓ Web server started");
+
+  // Start WebSocket
+  webSocket.begin();
+  webSocket.onEvent(webSocketEvent);
+  Serial.println("✓ WebSocket started on port 81");
+  
+  Serial.println("\n=== SYSTEM READY ===");
+  Serial.println("Access control panel at: http://" + WiFi.localIP().toString());
+  Serial.println("========================\n");
+}
+
+void loop() {
+  server.handleClient();
+  webSocket.loop();
+  
+  // Continuously update outputs (includes spark pulsing logic)
+  updateOutputs();
+  
+  // Keep sending ESC signal to maintain speed
+  compressorESC.writeMicroseconds(currentCompressorPulse);
+  delay(20);
+}
