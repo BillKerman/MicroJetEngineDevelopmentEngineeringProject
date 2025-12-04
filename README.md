@@ -8,6 +8,9 @@ Micro Jet Engine for UAV Applications [ Under Development ]– a compact 300N-th
 
 ![MICRO JET ENGINE POSTER _page-0001 (1)-min](https://github.com/user-attachments/assets/174fc376-889d-4e88-a09a-9b22eea6f891)
 
+ 
+<img width="1109" height="1377" alt="image" src="https://github.com/user-attachments/assets/a1df5951-18d2-4f09-8c64-d942fbcae7e6" />
+Circuit for IOT based control of compressor motor, fuel pump and spark plug.
 
 ![Older Design](https://github.com/user-attachments/assets/af901cf8-ad82-4bc7-b314-54eb03a04fdd)
 
