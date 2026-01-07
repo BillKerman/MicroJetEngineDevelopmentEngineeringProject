@@ -9,9 +9,6 @@ First run — Compressor + Fuel Injection Demo ---> (Video)https://drive.google.
 
 ![Combustion chamber and Fuel injection setup ](https://github.com/user-attachments/assets/df2d4e53-4dfb-47f7-ba94-564286b0a9c4)
 <img width="1199" height="768" alt="image" src="https://github.com/user-attachments/assets/7a0b49ec-5b18-4922-b62a-2cdefd7bea6a" />
-![Micro JetEngine Test Bed ]
-![TEST BED a](https://github.com/user-attachments/assets/6f436244-f0e0-4944-ac96-93d8cd797871)
-
 ![MICRO JET ENGINE POSTER _page-0001 (1)-min](https://github.com/user-attachments/assets/174fc376-889d-4e88-a09a-9b22eea6f891)
 
  
